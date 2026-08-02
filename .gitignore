@@ -1,0 +1,18 @@
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
+
+# Dependencias del proyecto
+node_modules/
+vendor/
+
+# Archivos de configuración o secretos con datos sensibles
+.env
+config.json
+
+# Excepción: No ignorar este archivo de entorno de ejemplo por favor
+!.env.example
+
+# Archivos de registro o temporales
+*.log
+*.tmp

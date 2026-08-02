@@ -19,9 +19,17 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
 // Inicializar con la variable de entorno de Render
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
+// La URL de tu Realtime Database (Consola Firebase -> Realtime Database -> arriba de la tabla de datos).
+// También puedes definirla como variable de entorno FIREBASE_DATABASE_URL en Render.
+const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || "https://TU_PROYECTO-default-rtdb.firebaseio.com";
+
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: FIREBASE_DATABASE_URL
 });
+
+// Referencia reutilizable a la Realtime Database desde el backend
+const rtdb = admin.database();
 
 const app = express();
 exports.app = app;
@@ -228,16 +236,13 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
 
     console.log(`[Backend] Procesando producto: "${id}"`);
 
-    const PRODUCTS_URL = "https://raw.githubusercontent.com/HCoreBeat/Buquenque/refs/heads/main/Json/products.json";
-
     try {
-        const response = await fetch(PRODUCTS_URL);
-        if (!response.ok) throw new Error(`Fetch fallido: ${response.status}`);
+        const snapshot = await rtdb.ref("products").once("value");
+        const productsObj = snapshot.val() || {};
+        const productsArray = Object.values(productsObj);
 
-        const json = await response.json();
-        
-        // Búsqueda en el JSON
-        const product = Array.isArray(json.products) && json.products.find(p => {
+        // Búsqueda en los productos
+        const product = productsArray.find(p => {
             const prodId = String(p.id).trim();
             const prodNombreEscaped = _escapeHtml(p.nombre).trim();
             const searchId = String(id).trim();
@@ -277,8 +282,9 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
         // Datos para Meta Tags
         const nombre = product.nombre || "Producto";
         const descripcion = product.descripcion || "Disponible en Buquenqe";
-        const imagen = (product.imagenes && product.imagenes.length) 
-            ? `https://raw.githubusercontent.com/HCoreBeat/Buquenque/refs/heads/main/Images/products/${encodeURIComponent(product.imagenes[0])}`
+        const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || "TU_CLOUD_NAME";
+        const imagen = (product.imagenes && product.imagenes.length)
+            ? `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/f_auto,q_auto/products/${encodeURIComponent(product.imagenes[0])}`
             : "https://www.buquenqe.com/Images/social-share-banner.jpg";
 
         // IMPORTANTE: URL absoluta para WhatsApp
