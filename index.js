@@ -458,6 +458,20 @@ app.post('/send-pedido', async (req, res) => {
         return res.status(400).json({ success: false, message: 'Datos de pedido no proporcionados.' });
     }
 
+    // 0. Respaldo inmediato en Firebase Realtime Database.
+    // Esto se guarda SIEMPRE, incluso si Google Sheets/Apps Script falla más
+    // adelante, para que ningún pedido se pierda nunca.
+    try {
+        const pedidoRef = await rtdb.ref('pedidos').push({
+            ...orderData,
+            fecha_registro_backend: new Date().toISOString()
+        });
+        console.log('📦 Respaldo del pedido guardado en Firebase con key:', pedidoRef.key);
+    } catch (firebaseBackupError) {
+        console.error('⚠️ No se pudo guardar el respaldo del pedido en Firebase:', firebaseBackupError);
+        // No se corta el flujo: seguimos intentando con Google igualmente.
+    }
+
     try {
         // 1. Enviar los datos al primer script (Web App)
         console.log('Enviando datos a Google Apps Script (Principal)...');
@@ -1322,7 +1336,11 @@ app.delete("/inventario/:id", async (req, res) => {
 });
 
 
-const APP_SHEET_RATINGS_URL = "https://script.google.com/macros/s/AKfycbxzzSXAsaRZJJh3eMmEtFnlKjdAjBG-BJ2JCgEfw2W-2Ehz-qaq4FyFe7i2nqpxyIh9/exec";
+// Los ratings ahora se guardan directamente en Firebase Realtime Database,
+// en la ruta /ratings/{productId}/votes/{userHash} -> número de estrellas (1 a 5).
+// Esto reemplaza el Google Apps Script que se usaba antes (más lento y con más
+// posibilidad de error). Un mismo userHash solo puede tener UN voto por producto:
+// si vuelve a votar, se actualiza (no se duplica).
 
 // POST /rate-product
 app.post("/rate-product", async (req, res) => {
@@ -1338,44 +1356,30 @@ app.post("/rate-product", async (req, res) => {
       return res.status(400).json({ success: false, message: "Rating inválido" });
     }
 
-    // Enviar a Apps Script
-    const payload = {
-      action: "addOrUpdateRating",
-      productId: String(productId),
-      userHash: String(userHash),
-      rating: numericRating
-    };
+    const safeProductId = String(productId);
+    const safeUserHash = String(userHash);
 
-    const response = await fetch(APP_SHEET_RATINGS_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+    // Guardar/actualizar el voto de este usuario para este producto
+    const voteRef = rtdb.ref(`ratings/${safeProductId}/votes/${safeUserHash}`);
+    const existingVoteSnap = await voteRef.once("value");
+    const action = existingVoteSnap.exists() ? "updated" : "created";
+    await voteRef.set(numericRating);
+
+    // Recalcular promedio y total de votos para este producto
+    const allVotesSnap = await rtdb.ref(`ratings/${safeProductId}/votes`).once("value");
+    const allVotes = Object.values(allVotesSnap.val() || {});
+    const totalVotes = allVotes.length;
+    const avgRating = totalVotes > 0 ? allVotes.reduce((a, b) => a + b, 0) / totalVotes : 0;
+
+    return res.json({
+      success: true,
+      productId: safeProductId,
+      userHash: safeUserHash,
+      rating: numericRating,
+      avgRating,
+      totalVotes,
+      action
     });
-
-    const text = await response.text();
-    let json;
-    try {
-      json = JSON.parse(text);
-    } catch (e) {
-      // Si Apps Script devolvió texto, encapsulamos
-      return res.status(502).json({ success: false, message: "Respuesta no válida desde Apps Script", raw: text });
-    }
-
-    if (json.status === "success") {
-      // Devolver al frontend la info necesaria
-      return res.json({
-        success: true,
-        row: json.row,
-        productId: json.productId,
-        userHash: json.userHash,
-        rating: json.rating,
-        avgRating: json.avgRating,
-        totalVotes: json.totalVotes,
-        action: json.action
-      });
-    } else {
-      return res.status(500).json({ success: false, message: json.message || "Error en Apps Script", raw: json });
-    }
   } catch (err) {
     console.error("Error /rate-product:", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1388,32 +1392,18 @@ app.get("/product-ratings", async (req, res) => {
     const productId = req.query.productId;
     if (!productId) return res.status(400).json({ success: false, message: "productId requerido" });
 
-    const payload = { action: "getProductRatings", productId: String(productId) };
-    const response = await fetch(APP_SHEET_RATINGS_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+    const safeProductId = String(productId);
+    const allVotesSnap = await rtdb.ref(`ratings/${safeProductId}/votes`).once("value");
+    const allVotes = Object.values(allVotesSnap.val() || {});
+    const totalVotes = allVotes.length;
+    const avgRating = totalVotes > 0 ? allVotes.reduce((a, b) => a + b, 0) / totalVotes : 0;
+
+    return res.json({
+      success: true,
+      productId: safeProductId,
+      avgRating,
+      totalVotes
     });
-
-    const text = await response.text();
-    let json;
-    try {
-      json = JSON.parse(text);
-    } catch (e) {
-      return res.status(502).json({ success: false, message: "Respuesta no válida desde Apps Script", raw: text });
-    }
-
-    if (json.status === "success") {
-      return res.json({
-        success: true,
-        productId: json.productId,
-        avgRating: json.avgRating,
-        totalVotes: json.totalVotes,
-        votes: json.votes // opcional
-      });
-    } else {
-      return res.status(500).json({ success: false, message: json.message || "Error en Apps Script" });
-    }
   } catch (err) {
     console.error("Error /product-ratings:", err);
     return res.status(500).json({ success: false, message: err.message });
