@@ -32,6 +32,29 @@ admin.initializeApp({
 // Referencia reutilizable a la Realtime Database desde el backend
 const rtdb = admin.database();
 
+// Array para almacenar los logs del servidor
+const serverLogs = [];
+
+// Variable para almacenar la fecha de inicio del servidor
+const serverStartTime = new Date();
+
+// Helper: obtener la hora actual en una timezone y formatearla YYYY-MM-DD HH:mm:ss
+function nowInTimeZone(timeZone) {
+    const now = new Date();
+    const zonedDate = utcToZonedTime(now, timeZone);
+    return formatTz(zonedDate, 'yyyy-MM-dd HH:mm:ss', { timeZone });
+}
+
+// Función para añadir logs y mantener un tamaño limitado
+function addLog(message) {
+    const timestamp = nowInTimeZone('America/Havana');
+    serverLogs.push(`[${timestamp}] ${message}`);
+    // Mantener solo los últimos 100 logs para evitar sobrecargar la memoria
+    if (serverLogs.length > 100) {
+        serverLogs.shift(); // Eliminar el log más antiguo
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Segunda instancia de Firebase RTDB para pedidos y catálogo aislados.
 // Se intenta cargar desde variables de entorno y, si no existen, desde el
@@ -126,6 +149,16 @@ async function writeSecondaryNode(refPath, payload) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(refPath).set(payload);
+}
+
+const USER_STATS_RTDB_PATH = 'stats/users';
+
+async function listUserStatisticsFromSecondary() {
+    return await readSecondaryCollection(USER_STATS_RTDB_PATH, []);
+}
+
+async function persistUserStatisticsToSecondary(statsArray) {
+    await writeSecondaryNode(USER_STATS_RTDB_PATH, Array.isArray(statsArray) ? statsArray : []);
 }
 
 async function deleteSecondaryNode(refPath) {
@@ -233,29 +266,6 @@ exports.app = app;
 
 // Servir archivos estáticos desde la carpeta public
 app.use(express.static('public'));
-
-// Array para almacenar los logs del servidor
-const serverLogs = [];
-
-// Variable para almacenar la fecha de inicio del servidor
-const serverStartTime = new Date();
-
-// Helper: obtener la hora actual en una timezone y formatearla YYYY-MM-DD HH:mm:ss
-function nowInTimeZone(timeZone) {
-    const now = new Date();
-    const zonedDate = utcToZonedTime(now, timeZone);
-    return formatTz(zonedDate, 'yyyy-MM-dd HH:mm:ss', { timeZone });
-}
-
-// Función para añadir logs y mantener un tamaño limitado
-function addLog(message) {
-    const timestamp = nowInTimeZone('America/Havana');
-    serverLogs.push(`[${timestamp}] ${message}`);
-    // Mantener solo los últimos 100 logs para evitar sobrecargar la memoria
-    if (serverLogs.length > 100) {
-        serverLogs.shift(); // Eliminar el log más antiguo
-    }
-}
 
 // Configuración de CORS
 const allowedOrigins = [
@@ -538,9 +548,8 @@ function _escapeHtml(unsafe) {
 
 // Ruta para guardar estadísticas
 app.post("/guardar-estadistica", async (req, res) => {
-    let release; // Declare release outside try to ensure it's accessible in finally
     try {
-        const nuevaEstadistica = req.body;
+        const nuevaEstadistica = req.body || {};
         addLog(`Recibida nueva estadística: ${JSON.stringify(nuevaEstadistica)}`);
 
         if (!nuevaEstadistica.ip || !nuevaEstadistica.pais || !nuevaEstadistica.origen) {
@@ -548,91 +557,57 @@ app.post("/guardar-estadistica", async (req, res) => {
             return res.status(400).json({ error: "Faltan campos obligatorios" });
         }
 
-        release = await lockfile.lock(filePath); // Assign release here
-        addLog(`Archivo bloqueado: ${filePath}`);
+        const estadisticas = await listUserStatisticsFromSecondary();
+        const usuarioExistente = estadisticas.find(est => est.ip === nuevaEstadistica.ip);
+        const fechaHoraCuba = nowInTimeZone('America/Havana');
 
-        fs.readFile(filePath, "utf8", (err, data) => {
-            if (err) {
-                if (err.code === 'ENOENT') {
-                    fs.writeFileSync(filePath, JSON.stringify([]));
-                    data = '[]';
-                    addLog(`Archivo no encontrado, inicializando: ${filePath}`);
-                } else {
-                    addLog(`ERROR: Error leyendo el archivo: ${err.message}`);
-                    if (release) release(); // Ensure unlock on error
-                    return res.status(500).json({ error: "Error leyendo el archivo" });
-                }
-            }
-
-            const estadisticas = data ? sanitizeJSON(data) : [];
-            const usuarioExistente = estadisticas.find(est => est.ip === nuevaEstadistica.ip);
-
-            const fechaHoraCuba = nowInTimeZone('America/Havana');
-
-            estadisticas.push({
-                ip: nuevaEstadistica.ip,
-                pais: nuevaEstadistica.pais,
-                fecha_hora_entrada: fechaHoraCuba,
-                origen: nuevaEstadistica.origen,
-                afiliado: nuevaEstadistica.afiliado || "Ninguno",
-                duracion_sesion_segundos: nuevaEstadistica.duracion_sesion_segundos || 0,
-                tiempo_carga_pagina_ms: nuevaEstadistica.tiempo_carga_pagina_ms || 0,
-                nombre_comprador: nuevaEstadistica.nombre_comprador || "N/A",
-                telefono_comprador: nuevaEstadistica.telefono_comprador || "N/A",
-                nombre_persona_entrega: nuevaEstadistica.nombre_persona_entrega || "N/A",
-                telefono_persona_entrega: nuevaEstadistica.telefono_persona_entrega || "N/A",
-                correo_comprador: nuevaEstadistica.correo_comprador || "N/A",
-                direccion_envio: nuevaEstadistica.direccion_envio || "N/A",
-                compras: nuevaEstadistica.compras || [],
-                precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
-                navegador: nuevaEstadistica.navegador || "Desconocido",
-                sistema_operativo: nuevaEstadistica.sistema_operativo || "Desconocido",
-                tipo_usuario: usuarioExistente ? "Recurrente" : "Único",
-                tiempo_promedio_pagina: nuevaEstadistica.tiempo_promedio_pagina || 0,
-                fuente_trafico: nuevaEstadistica.fuente_trafico || "Desconocido",
-            });
-
-            fs.writeFile(filePath, JSON.stringify(estadisticas, null, 2), (err) => {
-                if (err) {
-                    addLog(`ERROR: Error guardando el archivo: ${err.message}`);
-                    if (release) release(); // Ensure unlock on error
-                    return res.status(500).json({ error: "Error guardando el archivo" });
-                }
-                addLog("Estadística guardada correctamente.");
-                if (release) release(); // Unlock on success
-                res.json({ message: "Estadística guardada correctamente" });
-            });
+        estadisticas.push({
+            ip: nuevaEstadistica.ip,
+            pais: nuevaEstadistica.pais,
+            fecha_hora_entrada: fechaHoraCuba,
+            origen: nuevaEstadistica.origen,
+            afiliado: nuevaEstadistica.afiliado || "Ninguno",
+            duracion_sesion_segundos: nuevaEstadistica.duracion_sesion_segundos || 0,
+            tiempo_carga_pagina_ms: nuevaEstadistica.tiempo_carga_pagina_ms || 0,
+            nombre_comprador: nuevaEstadistica.nombre_comprador || "N/A",
+            telefono_comprador: nuevaEstadistica.telefono_comprador || "N/A",
+            nombre_persona_entrega: nuevaEstadistica.nombre_persona_entrega || "N/A",
+            telefono_persona_entrega: nuevaEstadistica.telefono_persona_entrega || "N/A",
+            correo_comprador: nuevaEstadistica.correo_comprador || "N/A",
+            direccion_envio: nuevaEstadistica.direccion_envio || "N/A",
+            compras: nuevaEstadistica.compras || [],
+            precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
+            navegador: nuevaEstadistica.navegador || "Desconocido",
+            sistema_operativo: nuevaEstadistica.sistema_operativo || "Desconocido",
+            tipo_usuario: usuarioExistente ? "Recurrente" : "Único",
+            tiempo_promedio_pagina: nuevaEstadistica.tiempo_promedio_pagina || 0,
+            fuente_trafico: nuevaEstadistica.fuente_trafico || "Desconocido",
         });
+
+        await persistUserStatisticsToSecondary(estadisticas);
+        addLog("Estadística guardada correctamente en Firebase RTDB.");
+        return res.json({ message: "Estadística guardada correctamente" });
     } catch (error) {
         addLog(`ERROR: Error en /guardar-estadistica: ${error.message}`);
-        if (release) release(); // Ensure unlock on error
+        if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
+            return res.status(503).json({ error: error.message });
+        }
         res.status(500).json({ error: "Error interno del servidor" });
     }
 });
 
 // Ruta para obtener estadísticas
 app.get("/obtener-estadisticas", async (req, res) => {
-    let release; // Declare release outside try
     try {
         addLog("Solicitud para obtener estadísticas.");
-        release = await lockfile.lock(filePath); // Assign release here
-        addLog(`Archivo bloqueado para lectura: ${filePath}`);
-
-        fs.readFile(filePath, "utf8", (err, data) => {
-            if (err && err.code !== "ENOENT") {
-                addLog(`ERROR: Error leyendo el archivo de estadísticas: ${err.message}`);
-                if (release) release(); // Ensure unlock on error
-                return res.status(500).json({ error: "Error leyendo el archivo" });
-            }
-
-            const estadisticas = data ? sanitizeJSON(data) : [];
-            addLog(`Estadísticas enviadas: ${estadisticas.length} registros.`);
-            if (release) release(); // Unlock on success
-            res.json(estadisticas);
-        });
+        const estadisticas = await listUserStatisticsFromSecondary();
+        addLog(`Estadísticas enviadas: ${estadisticas.length} registros.`);
+        res.json(estadisticas);
     } catch (error) {
         addLog(`ERROR: Error en /obtener-estadisticas: ${error.message}`);
-        if (release) release(); // Ensure unlock on error
+        if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
+            return res.status(503).json({ error: error.message });
+        }
         res.status(500).json({ error: "Error interno del servidor" });
     }
 });
@@ -924,8 +899,8 @@ async function compareLocalAndRemoteData() {
     let release;
 
     try {
-        // Leer datos locales
-        const localData = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
+        // Leer datos locales desde la fuente de verdad del nuevo sistema (RTDB secundaria)
+        const localData = await listUserStatisticsFromSecondary();
 
         // Obtener datos remotos
         const response = await fetch(remoteUrl);
@@ -1025,29 +1000,8 @@ app.post("/api/clear-statistics", async (req, res) => {
     try {
         addLog("Solicitud para limpiar estadísticas recibida");
 
-        // Asegurar que el directorio existe
-        if (!fs.existsSync(directoryPath)) {
-            addLog("Directorio no encontrado. Creando directorio...");
-            await fs.promises.mkdir(directoryPath, { recursive: true });
-            addLog(`Directorio creado: ${directoryPath}`);
-        }
-
-        // Intentar borrar el archivo si existe
-        if (fs.existsSync(filePath)) {
-            addLog("Archivo de estadísticas encontrado. Eliminando archivo...");
-            await fs.promises.unlink(filePath);
-            addLog("Archivo de estadísticas eliminado");
-        } else {
-            addLog("Archivo de estadísticas no encontrado. Se creará uno nuevo.");
-        }
-
-        // Crear nuevo archivo con array vacío
-        addLog("Creando nuevo archivo de estadísticas...");
-        await fs.promises.writeFile(filePath, "[]", { 
-            encoding: 'utf8',
-            mode: 0o666 // Permisos de lectura y escritura para todos
-        });
-        addLog("Nuevo archivo de estadísticas creado correctamente");
+        await persistUserStatisticsToSecondary([]);
+        addLog("Colección de estadísticas reiniciada en Firebase RTDB.");
 
         // Como se borraron todos los pedidos locales, la lista de pedidos
         // descartados manualmente ya no tiene ninguna referencia válida:
@@ -1068,6 +1022,9 @@ app.post("/api/clear-statistics", async (req, res) => {
         const errorMessage = `Error al limpiar estadísticas: ${error.message}`;
         addLog(`ERROR: ${errorMessage}`);
         console.error(errorMessage);
+        if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
+            return res.status(503).json({ success: false, error: errorMessage });
+        }
         res.status(500).json({ 
             success: false, 
             error: errorMessage 
