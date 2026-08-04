@@ -32,6 +32,81 @@ admin.initializeApp({
 // Referencia reutilizable a la Realtime Database desde el backend
 const rtdb = admin.database();
 
+// -----------------------------------------------------------------------------
+// Cloudinary: gestión real de imágenes de productos (subida y borrado).
+// Requiere las variables de entorno CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY
+// y CLOUDINARY_API_SECRET. Si no están configuradas, la subida/borrado se
+// omite de forma segura (no rompe el flujo, solo no gestiona la imagen).
+// -----------------------------------------------------------------------------
+const cloudinary = require('cloudinary').v2;
+const CLOUDINARY_PRODUCTS_FOLDER = 'products';
+let cloudinaryConfigured = false;
+
+if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+    cloudinary.config({
+        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+        api_key: process.env.CLOUDINARY_API_KEY,
+        api_secret: process.env.CLOUDINARY_API_SECRET
+    });
+    cloudinaryConfigured = true;
+} else {
+    console.warn('WARN: Cloudinary no está totalmente configurado (faltan CLOUDINARY_CLOUD_NAME/API_KEY/API_SECRET). La subida/borrado de imágenes de productos se omitirá.');
+}
+
+// Sube una imagen a Cloudinary. Acepta un data URI (base64) o una URL remota.
+// Devuelve el public_id relativo (sin la carpeta) para mantener el mismo
+// formato que ya usa /p/:id al construir las URLs de imagen.
+async function cloudinaryUploadProductImage(source, desiredPublicId) {
+    if (!cloudinaryConfigured || !source) return null;
+    const uploadOptions = {
+        folder: CLOUDINARY_PRODUCTS_FOLDER,
+        overwrite: true,
+        resource_type: 'image'
+    };
+    if (desiredPublicId) {
+        uploadOptions.public_id = desiredPublicId;
+    }
+    const result = await cloudinary.uploader.upload(source, uploadOptions);
+    // result.public_id viene como "products/xxxx" -> nos quedamos solo con "xxxx"
+    return result.public_id.startsWith(`${CLOUDINARY_PRODUCTS_FOLDER}/`)
+        ? result.public_id.slice(CLOUDINARY_PRODUCTS_FOLDER.length + 1)
+        : result.public_id;
+}
+
+// Elimina una imagen de Cloudinary a partir de su public_id relativo (el mismo
+// valor que se guarda en el campo "imagenes" del producto).
+async function cloudinaryDeleteProductImage(publicIdRelative) {
+    if (!cloudinaryConfigured || !publicIdRelative) return;
+    try {
+        await cloudinary.uploader.destroy(`${CLOUDINARY_PRODUCTS_FOLDER}/${publicIdRelative}`, { resource_type: 'image' });
+    } catch (error) {
+        console.warn(`WARN: No se pudo eliminar la imagen de Cloudinary (${publicIdRelative}):`, error.message);
+    }
+}
+
+// Un valor de imagen "nuevo" (a subir) es un data URI base64 o una URL http(s).
+// Un valor ya existente (public_id guardado previamente) se deja tal cual.
+function isUploadableImageValue(value) {
+    return typeof value === 'string' && (value.startsWith('data:image/') || /^https?:\/\//i.test(value));
+}
+
+// Procesa un array de "imagenes" recibido del panel admin: sube los valores
+// nuevos (data URI o URL) a Cloudinary y conserva los public_id ya existentes.
+async function processProductImages(imagenes, productId) {
+    const list = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
+    const processed = [];
+    for (let i = 0; i < list.length; i++) {
+        const value = list[i];
+        if (isUploadableImageValue(value)) {
+            const publicId = await cloudinaryUploadProductImage(value, undefined);
+            if (publicId) processed.push(publicId);
+        } else if (value) {
+            processed.push(value);
+        }
+    }
+    return processed;
+}
+
 // Array para almacenar los logs del servidor
 const serverLogs = [];
 
@@ -151,14 +226,94 @@ async function writeSecondaryNode(refPath, payload) {
     await secondaryRtdb.ref(refPath).set(payload);
 }
 
-const USER_STATS_RTDB_PATH = 'stats/users';
+// -----------------------------------------------------------------------------
+// Nueva arquitectura de ramas en la RTDB secundaria (datos-buquenque):
+//   /estadisticas      -> SOLO stats de visitas (sin el array "compras")
+//   /pedidos           -> pedidos completos (con "compras") creados desde /guardar-estadistica
+//   /pedidos_asignados -> copia de un pedido de /pedidos para darle seguimiento individual
+// -----------------------------------------------------------------------------
+const ESTADISTICAS_RTDB_PATH = 'estadisticas';
+const PEDIDOS_RTDB_PATH = 'pedidos';
+const PEDIDOS_ASIGNADOS_RTDB_PATH = 'pedidos_asignados';
 
 async function listUserStatisticsFromSecondary() {
-    return await readSecondaryCollection(USER_STATS_RTDB_PATH, []);
+    return await readSecondaryCollection(ESTADISTICAS_RTDB_PATH, []);
 }
 
 async function persistUserStatisticsToSecondary(statsArray) {
-    await writeSecondaryNode(USER_STATS_RTDB_PATH, Array.isArray(statsArray) ? statsArray : []);
+    await writeSecondaryNode(ESTADISTICAS_RTDB_PATH, Array.isArray(statsArray) ? statsArray : []);
+}
+
+// Helpers genéricos para colecciones basadas en push-id (objeto { id: valor })
+// usadas por /pedidos y /pedidos_asignados, para poder hacer CRUD por id.
+async function listSecondaryPushCollection(refPath) {
+    if (!secondaryRtdb) return [];
+    const snapshot = await secondaryRtdb.ref(refPath).once('value');
+    const data = snapshot.val();
+    if (!data || typeof data !== 'object') return [];
+    return Object.entries(data).map(([id, value]) => ({ id, ...value }));
+}
+
+async function getSecondaryPushRecord(refPath, id) {
+    if (!secondaryRtdb) return null;
+    const snapshot = await secondaryRtdb.ref(`${refPath}/${id}`).once('value');
+    const data = snapshot.val();
+    if (!data) return null;
+    return { id, ...data };
+}
+
+async function addSecondaryPushRecord(refPath, value) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    const ref = await secondaryRtdb.ref(refPath).push(value);
+    return ref.key;
+}
+
+async function updateSecondaryPushRecord(refPath, id, patch) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`${refPath}/${id}`).update(patch);
+    return await getSecondaryPushRecord(refPath, id);
+}
+
+async function deleteSecondaryPushRecord(refPath, id) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`${refPath}/${id}`).remove();
+}
+
+// Determina si un pedido pertenece al mismo usuario que otro, comparando por
+// teléfono, correo o un id explícito (lo que esté disponible en ambos).
+function ordersBelongToSameUser(a, b) {
+    if (!a || !b) return false;
+    const telA = String(a.telefono_comprador || '').trim();
+    const telB = String(b.telefono_comprador || '').trim();
+    if (telA && telB && telA === telB) return true;
+
+    const mailA = String(a.correo_comprador || '').trim().toLowerCase();
+    const mailB = String(b.correo_comprador || '').trim().toLowerCase();
+    if (mailA && mailA !== 'n/a' && mailA === mailB) return true;
+
+    const idA = a.usuarioId || a.userId || a.id_usuario;
+    const idB = b.usuarioId || b.userId || b.id_usuario;
+    if (idA && idB && String(idA) === String(idB)) return true;
+
+    return false;
+}
+
+// Revisa si el usuario dueño de "pedido" ya tiene compras anteriores
+// registradas en /pedidos o /pedidos_asignados (excluyendo el propio pedido).
+async function checkUsuarioReincidente(pedido, excludeId) {
+    const [pedidosPrevios, asignadosPrevios] = await Promise.all([
+        listSecondaryPushCollection(PEDIDOS_RTDB_PATH),
+        listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH)
+    ]);
+
+    const historial = [...pedidosPrevios, ...asignadosPrevios].filter(item => item.id !== excludeId);
+    return historial.some(item => ordersBelongToSameUser(item, pedido));
 }
 
 async function deleteSecondaryNode(refPath) {
@@ -547,7 +702,12 @@ function _escapeHtml(unsafe) {
         .replace(/'/g, "&#039;");
 }
 
-// Ruta para guardar estadísticas
+// Ruta para guardar estadísticas.
+// IMPORTANTE: el payload que envía el frontend NO cambia (misma estructura de
+// siempre, incluyendo "compras" cuando el hit corresponde a una compra). Lo
+// que cambia es SOLO el destino en la RTDB secundaria:
+//   - Si trae "compras" con productos  -> se guarda el pedido completo en /pedidos
+//   - Si NO trae compras (visita pura) -> se guarda en /estadisticas (sin el campo compras)
 app.post("/guardar-estadistica", async (req, res) => {
     try {
         const nuevaEstadistica = req.body || {};
@@ -558,11 +718,17 @@ app.post("/guardar-estadistica", async (req, res) => {
             return res.status(400).json({ error: "Faltan campos obligatorios" });
         }
 
-        const estadisticas = await listUserStatisticsFromSecondary();
-        const usuarioExistente = estadisticas.find(est => est.ip === nuevaEstadistica.ip);
+        const tieneCompras = Array.isArray(nuevaEstadistica.compras) && nuevaEstadistica.compras.length > 0;
+
+        const [estadisticasPrevias, pedidosPrevios] = await Promise.all([
+            listUserStatisticsFromSecondary(),
+            listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+        ]);
+        const usuarioExistente = estadisticasPrevias.some(est => est.ip === nuevaEstadistica.ip)
+            || pedidosPrevios.some(ped => ped.ip === nuevaEstadistica.ip);
         const fechaHoraCuba = nowInTimeZone('America/Havana');
 
-        estadisticas.push({
+        const registroBase = {
             ip: nuevaEstadistica.ip,
             pais: nuevaEstadistica.pais,
             fecha_hora_entrada: fechaHoraCuba,
@@ -576,17 +742,27 @@ app.post("/guardar-estadistica", async (req, res) => {
             telefono_persona_entrega: nuevaEstadistica.telefono_persona_entrega || "N/A",
             correo_comprador: nuevaEstadistica.correo_comprador || "N/A",
             direccion_envio: nuevaEstadistica.direccion_envio || "N/A",
-            compras: nuevaEstadistica.compras || [],
             precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
             navegador: nuevaEstadistica.navegador || "Desconocido",
             sistema_operativo: nuevaEstadistica.sistema_operativo || "Desconocido",
             tipo_usuario: usuarioExistente ? "Recurrente" : "Único",
             tiempo_promedio_pagina: nuevaEstadistica.tiempo_promedio_pagina || 0,
             fuente_trafico: nuevaEstadistica.fuente_trafico || "Desconocido",
-        });
+        };
 
-        await persistUserStatisticsToSecondary(estadisticas);
-        addLog("Estadística guardada correctamente en Firebase RTDB.");
+        if (tieneCompras) {
+            const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, {
+                ...registroBase,
+                compras: nuevaEstadistica.compras
+            });
+            addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}).`);
+        } else {
+            const estadisticas = estadisticasPrevias;
+            estadisticas.push(registroBase); // sin "compras": los stats puros no llevan compras
+            await persistUserStatisticsToSecondary(estadisticas);
+            addLog("Estadística guardada correctamente en /estadisticas.");
+        }
+
         return res.json({ message: "Estadística guardada correctamente" });
     } catch (error) {
         addLog(`ERROR: Error en /guardar-estadistica: ${error.message}`);
@@ -851,7 +1027,154 @@ app.get('/api/pedidos-sheets', async (req, res) => {
     }
 });
 
+// =====================================================
+// 🧾 CRUD DE /pedidos (RTDB secundaria)
+// Pedidos completos (con "compras") creados automáticamente desde
+// /guardar-estadistica cuando el frontend envía una compra.
+// =====================================================
 
+// GET /api/pedidos -> listar todos los pedidos
+app.get('/api/pedidos', async (req, res) => {
+    try {
+        const pedidos = await listSecondaryPushCollection(PEDIDOS_RTDB_PATH);
+        return res.json({ success: true, pedidos });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pedidos', error: error.message });
+    }
+});
+
+// GET /api/pedidos/:id -> obtener un pedido puntual
+app.get('/api/pedidos/:id', async (req, res) => {
+    try {
+        const pedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        if (!pedido) {
+            return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
+        }
+        return res.json({ success: true, pedido });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el pedido', error: error.message });
+    }
+});
+
+// PUT/PATCH /api/pedidos/:id -> editar un pedido
+async function actualizarPedidoHandler(req, res) {
+    try {
+        const existente = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        if (!existente) {
+            return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
+        }
+        const patch = { ...(req.body || {}) };
+        delete patch.id; // el id no se modifica
+        const actualizado = await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id, patch);
+        return res.json({ success: true, pedido: actualizado });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar el pedido', error: error.message });
+    }
+}
+app.put('/api/pedidos/:id', actualizarPedidoHandler);
+app.patch('/api/pedidos/:id', actualizarPedidoHandler);
+
+// DELETE /api/pedidos/:id -> eliminar un pedido de /pedidos
+app.delete('/api/pedidos/:id', async (req, res) => {
+    try {
+        const existente = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        if (!existente) {
+            return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
+        }
+        await deleteSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        return res.json({ success: true, deletedId: req.params.id });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el pedido', error: error.message });
+    }
+});
+
+// POST /api/pedidos/:id/asignar -> copia el pedido a /pedidos_asignados para
+// darle seguimiento individual, SIN borrar el original de /pedidos. Marca
+// automáticamente si el usuario (teléfono/correo/id) ya había comprado antes.
+app.post('/api/pedidos/:id/asignar', async (req, res) => {
+    try {
+        const pedidoOriginal = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
+        if (!pedidoOriginal) {
+            return res.status(404).json({ success: false, message: 'Pedido no encontrado en /pedidos.' });
+        }
+
+        const { id: _ignoredId, ...datosPedido } = pedidoOriginal;
+        const usuarioReincidente = await checkUsuarioReincidente(pedidoOriginal, pedidoOriginal.id);
+
+        const nuevoRegistro = {
+            ...datosPedido,
+            pedido_origen_id: pedidoOriginal.id,
+            usuarioReincidente,
+            fecha_asignacion: nowInTimeZone('America/Havana'),
+            ...(req.body && typeof req.body === 'object' ? { estado: req.body.estado } : {})
+        };
+        // No guardar la clave "estado" como undefined si no vino en el body
+        if (nuevoRegistro.estado === undefined) delete nuevoRegistro.estado;
+
+        const asignadoId = await addSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, nuevoRegistro);
+        const pedidoAsignado = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, asignadoId);
+
+        addLog(`Pedido ${pedidoOriginal.id} asignado a seguimiento (id: ${asignadoId}, reincidente: ${usuarioReincidente}).`);
+        return res.status(201).json({ success: true, pedido: pedidoAsignado });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al asignar el pedido', error: error.message });
+    }
+});
+
+// =====================================================
+// 🚚 CRUD DE /pedidos_asignados (seguimiento individual)
+// =====================================================
+
+app.get('/api/pedidos-asignados', async (req, res) => {
+    try {
+        const pedidosAsignados = await listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH);
+        return res.json({ success: true, pedidosAsignados });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pedidos asignados', error: error.message });
+    }
+});
+
+app.get('/api/pedidos-asignados/:id', async (req, res) => {
+    try {
+        const pedido = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        if (!pedido) {
+            return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
+        }
+        return res.json({ success: true, pedido });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el pedido asignado', error: error.message });
+    }
+});
+
+async function actualizarPedidoAsignadoHandler(req, res) {
+    try {
+        const existente = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        if (!existente) {
+            return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
+        }
+        const patch = { ...(req.body || {}) };
+        delete patch.id;
+        const actualizado = await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch);
+        return res.json({ success: true, pedido: actualizado });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar el pedido asignado', error: error.message });
+    }
+}
+app.put('/api/pedidos-asignados/:id', actualizarPedidoAsignadoHandler);
+app.patch('/api/pedidos-asignados/:id', actualizarPedidoAsignadoHandler);
+
+app.delete('/api/pedidos-asignados/:id', async (req, res) => {
+    try {
+        const existente = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        if (!existente) {
+            return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
+        }
+        await deleteSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+        return res.json({ success: true, deletedId: req.params.id });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el pedido asignado', error: error.message });
+    }
+});
 
 // Nueva ruta API para obtener el estado del servidor
 app.get("/api/server-status", async (req, res) => {
@@ -900,8 +1223,10 @@ async function compareLocalAndRemoteData() {
     let release;
 
     try {
-        // Leer datos locales desde la fuente de verdad del nuevo sistema (RTDB secundaria)
-        const localData = await listUserStatisticsFromSecondary();
+        // Leer los pedidos locales desde /pedidos (RTDB secundaria). Antes esto
+        // se leía de stats/users filtrando por "compras", pero esa rama ahora
+        // solo contiene visitas puras (sin compras); los pedidos viven en /pedidos.
+        const localData = await listSecondaryPushCollection(PEDIDOS_RTDB_PATH);
 
         // Obtener datos remotos
         const response = await fetch(remoteUrl);
@@ -1086,10 +1411,15 @@ app.get('/api/products/:id', async (req, res) => {
 
 app.post('/api/products', async (req, res) => {
     try {
-        const incoming = normalizeProductPayload(req.body || {});
-        if (!incoming.nombre) {
+        const body = req.body || {};
+        if (!body.nombre) {
             return res.status(400).json({ success: false, message: 'El campo "nombre" es obligatorio.' });
         }
+
+        // Sube a Cloudinary cualquier imagen nueva (data URI o URL) recibida
+        // en "imagenes"; conserva tal cual los public_id ya existentes.
+        const imagenesProcesadas = await processProductImages(body.imagenes);
+        const incoming = normalizeProductPayload({ ...body, imagenes: imagenesProcesadas });
 
         const productMap = await getSecondaryProductMap();
         productMap[incoming.id] = incoming;
@@ -1110,9 +1440,15 @@ app.patch('/api/products/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
         }
 
+        const body = { ...req.body || {} };
+        if (body.imagenes !== undefined) {
+            // Sube las imágenes nuevas y deja intactas las que ya eran public_id existentes
+            body.imagenes = await processProductImages(body.imagenes);
+        }
+
         const updatedProduct = {
             ...existing,
-            ...normalizeProductPayload({ ...existing, ...req.body || {}, id: existing.id }),
+            ...normalizeProductPayload({ ...existing, ...body, id: existing.id }),
             id: existing.id,
             fecha_actualizacion: nowInTimeZone('America/Havana')
         };
@@ -1134,6 +1470,10 @@ app.delete('/api/products/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
         }
 
+        // Eliminar también las imágenes del producto en Cloudinary (best-effort)
+        const imagenesAEliminar = Array.isArray(existed.imagenes) ? existed.imagenes : [];
+        await Promise.all(imagenesAEliminar.map(publicId => cloudinaryDeleteProductImage(publicId)));
+
         delete productMap[id];
         await persistSecondaryProductMap(productMap);
         return res.json({ success: true, deletedId: id, products: Object.values(productMap) });
@@ -1152,10 +1492,18 @@ app.post('/api/products/:id/images', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
         }
 
-        const urls = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
+        // Sube a Cloudinary las imágenes nuevas (data URI o URL)
+        const uploaded = await processProductImages(imagenes);
+
+        if (action === 'replace') {
+            // Si se reemplazan todas las imágenes, borra de Cloudinary las anteriores
+            const anteriores = Array.isArray(existing.imagenes) ? existing.imagenes : [];
+            await Promise.all(anteriores.map(publicId => cloudinaryDeleteProductImage(publicId)));
+        }
+
         const nextImages = action === 'append'
-            ? [...(existing.imagenes || []), ...urls]
-            : urls;
+            ? [...(existing.imagenes || []), ...uploaded]
+            : uploaded;
 
         existing.imagenes = nextImages;
         existing.fecha_actualizacion = nowInTimeZone('America/Havana');
@@ -1182,7 +1530,9 @@ app.delete('/api/products/:id/images/:index', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Índice de imagen inválido.' });
         }
 
-        existing.imagenes.splice(imageIndex, 1);
+        const [publicIdEliminado] = existing.imagenes.splice(imageIndex, 1);
+        await cloudinaryDeleteProductImage(publicIdEliminado);
+
         existing.fecha_actualizacion = nowInTimeZone('America/Havana');
         productMap[existing.id] = existing;
         await persistSecondaryProductMap(productMap);
