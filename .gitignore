@@ -16,3 +16,6 @@ config.json
 # Archivos de registro o temporales
 *.log
 *.tmp
+
+datos-buquenque-firebase.json
+nueva base de datos.txt

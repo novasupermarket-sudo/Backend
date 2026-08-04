@@ -1,5 +1,6 @@
 const express = require("express");
 const fs = require("fs");
+const path = require('path');
 const cors = require("cors");
 const lockfile = require("proper-lockfile");
 const { utcToZonedTime, format: formatTz } = require('date-fns-tz');
@@ -30,6 +31,202 @@ admin.initializeApp({
 
 // Referencia reutilizable a la Realtime Database desde el backend
 const rtdb = admin.database();
+
+// -----------------------------------------------------------------------------
+// Segunda instancia de Firebase RTDB para pedidos y catálogo aislados.
+// Se intenta cargar desde variables de entorno y, si no existen, desde el
+// archivo adjunto "nueva base de datos.txt" del workspace para continuar con
+// una ejecución local sin romper la base de datos principal.
+// -----------------------------------------------------------------------------
+const SECONDARY_FIREBASE_APP_NAME = 'secondary-rtdb';
+const SECONDARY_FIREBASE_DATABASE_URL = process.env.FIREBASE_SECOND_DATABASE_URL || "https://datos-buquenque-default-rtdb.europe-west1.firebasedatabase.app/";
+
+function loadSecondaryServiceAccountFromEnv() {
+    const raw = process.env.FIREBASE_SECOND_SERVICE_ACCOUNT;
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw);
+    } catch (error) {
+        console.error('ERROR: FIREBASE_SECOND_SERVICE_ACCOUNT no es un JSON válido:', error.message);
+        return null;
+    }
+}
+
+function loadSecondaryServiceAccountFromFile() {
+    const secondaryTxtPath = path.join(__dirname, 'nueva base de datos.txt');
+    if (!fs.existsSync(secondaryTxtPath)) {
+        return null;
+    }
+
+    try {
+        const fileContent = fs.readFileSync(secondaryTxtPath, 'utf8');
+        const jsonBlockMatch = fileContent.match(/\{[\s\S]*"client_email"\s*:\s*"[^"]+"[\s\S]*\}/);
+        if (!jsonBlockMatch) {
+            return null;
+        }
+        return JSON.parse(jsonBlockMatch[0]);
+    } catch (error) {
+        console.warn('WARN: No fue posible extraer la credencial secundaria del archivo txt:', error.message);
+        return null;
+    }
+}
+
+const secondaryServiceAccount = loadSecondaryServiceAccountFromEnv() || loadSecondaryServiceAccountFromFile();
+let secondaryRtdb = null;
+
+if (secondaryServiceAccount) {
+    admin.initializeApp({
+        credential: admin.credential.cert(secondaryServiceAccount),
+        databaseURL: SECONDARY_FIREBASE_DATABASE_URL
+    }, SECONDARY_FIREBASE_APP_NAME);
+    secondaryRtdb = admin.app(SECONDARY_FIREBASE_APP_NAME).database();
+    addLog('Instancia secundaria de Firebase RTDB inicializada correctamente.');
+} else {
+    console.warn('WARN: No se encontró la segunda instancia de Firebase RTDB. Los nuevos endpoints de pedidos y productos devolverán 503 hasta configurar FIREBASE_SECOND_SERVICE_ACCOUNT y FIREBASE_SECOND_DATABASE_URL.');
+}
+
+async function readSecondaryCollection(refPath, defaultValue = []) {
+    if (!secondaryRtdb) {
+        return Array.isArray(defaultValue) ? [...defaultValue] : defaultValue;
+    }
+
+    const snapshot = await secondaryRtdb.ref(refPath).once('value');
+    const data = snapshot.val();
+
+    if (Array.isArray(data)) {
+        return data;
+    }
+
+    if (data && typeof data === 'object') {
+        return Object.values(data);
+    }
+
+    return Array.isArray(defaultValue) ? [...defaultValue] : defaultValue;
+}
+
+async function writeSecondaryCollection(refPath, payload) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(refPath).set(payload);
+}
+
+async function readSecondaryNode(refPath, defaultValue = []) {
+    if (!secondaryRtdb) {
+        return Array.isArray(defaultValue) ? [...defaultValue] : defaultValue;
+    }
+
+    const snapshot = await secondaryRtdb.ref(refPath).once('value');
+    const data = snapshot.val();
+    return data === null || data === undefined ? defaultValue : data;
+}
+
+async function writeSecondaryNode(refPath, payload) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(refPath).set(payload);
+}
+
+async function deleteSecondaryNode(refPath) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(refPath).remove();
+}
+
+function normalizeProductPayload(payload = {}) {
+    const imagenes = Array.isArray(payload.imagenes)
+        ? payload.imagenes
+        : (payload.imagenes ? [payload.imagenes] : []);
+
+    return {
+        id: payload.id || crypto.randomUUID(),
+        nombre: payload.nombre || 'Sin nombre',
+        descripcion: payload.descripcion || '',
+        precio: Number(payload.precio ?? 0),
+        categoria: payload.categoria || 'general',
+        stock: Number(payload.stock ?? 0),
+        oferta: Boolean(payload.oferta),
+        descuento: Number(payload.descuento ?? 0),
+        imagenes,
+        activo: payload.activo !== false,
+        fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
+        fecha_actualizacion: nowInTimeZone('America/Havana')
+    };
+}
+
+async function getSecondaryProductMap() {
+    if (!secondaryRtdb) {
+        return {};
+    }
+    const map = await readSecondaryNode('catalog/products', {});
+    return map && typeof map === 'object' ? map : {};
+}
+
+async function persistSecondaryProductMap(productMap) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await writeSecondaryNode('catalog/products', productMap || {});
+}
+
+function normalizeManagedOrderPayload(payload = {}) {
+    const fechaActual = nowInTimeZone('America/Havana');
+    return {
+        id: payload.id || crypto.randomUUID(),
+        nombre_cliente: String(payload.nombre_cliente || '').trim(),
+        pais: payload.pais ? String(payload.pais) : 'N/A',
+        telefono: String(payload.telefono || '').trim(),
+        precio_total: Number(payload.precio_total ?? 0),
+        aceptado: Boolean(payload.aceptado),
+        entregado: Boolean(payload.entregado),
+        enviado_a_pagar: Boolean(payload.enviado_a_pagar),
+        pagado: Boolean(payload.pagado),
+        enviado_grupo_pagos: Boolean(payload.enviado_grupo_pagos),
+        origen: payload.origen === 'new-order' ? 'new-order' : 'manual',
+        source_key: payload.origen === 'new-order' && payload.sourceKey ? buildOrderKey(payload.sourceKey) : null,
+        fecha_creacion: payload.fecha_creacion || fechaActual,
+        fecha_actualizacion: fechaActual
+    };
+}
+
+function toArrayPayload(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (payload && typeof payload === 'object') return Object.values(payload);
+    return [];
+}
+
+async function listSecondaryOrdersByBranch(branch) {
+    if (!secondaryRtdb) {
+        return [];
+    }
+
+    const snapshot = await secondaryRtdb.ref(`orders/${branch}`).once('value');
+    return toArrayPayload(snapshot.val() || []);
+}
+
+async function writeSecondaryOrdersByBranch(branch, payload) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}`).set(Array.isArray(payload) ? payload : []);
+}
+
+async function upsertSecondaryOrderRecord(order) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    const orders = await listSecondaryOrdersByBranch('managed');
+    const existingIndex = orders.findIndex(item => item.id === order.id);
+    if (existingIndex >= 0) {
+        orders[existingIndex] = { ...orders[existingIndex], ...order, fecha_actualizacion: nowInTimeZone('America/Havana') };
+    } else {
+        orders.push(order);
+    }
+    await writeSecondaryOrdersByBranch('managed', orders);
+    return orders;
+}
 
 const app = express();
 exports.app = app;
@@ -91,7 +288,6 @@ app.use(cors({
 app.use(express.json());
 
 // Configuración de rutas y archivos
-const path = require('path');
 const directoryPath = path.join(__dirname, "data");
 const filePath = path.join(directoryPath, "estadistica.json");
 const fcmTokensFilePath = path.join(directoryPath, "fcm_tokens.json");
@@ -895,10 +1091,157 @@ app.get("/api/get-comparison", async (req, res) => {
     }
 });
 
-// Endpoint para obtener los pedidos nuevos desde comparison.json
-app.get('/api/new-orders', async (req, res) => {
-
+// =====================================================
+// 📦 CRUD DE PRODUCTOS (según nueva base aislada en RTDB)
+// =====================================================
+app.get('/api/products', async (req, res) => {
     try {
+        if (!secondaryRtdb) {
+            return res.json({ success: true, products: [] });
+        }
+
+        const products = await readSecondaryCollection('catalog/products');
+        return res.json({ success: true, products });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener productos', error: error.message });
+    }
+});
+
+app.get('/api/products/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!secondaryRtdb) {
+            return res.status(503).json({ success: false, message: 'La instancia secundaria de Firebase RTDB no está disponible.' });
+        }
+
+        const productMap = await getSecondaryProductMap();
+        const product = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!product) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        return res.json({ success: true, product });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el producto', error: error.message });
+    }
+});
+
+app.post('/api/products', async (req, res) => {
+    try {
+        const incoming = normalizeProductPayload(req.body || {});
+        if (!incoming.nombre) {
+            return res.status(400).json({ success: false, message: 'El campo "nombre" es obligatorio.' });
+        }
+
+        const productMap = await getSecondaryProductMap();
+        productMap[incoming.id] = incoming;
+        await persistSecondaryProductMap(productMap);
+
+        return res.status(201).json({ success: true, product: incoming, products: Object.values(productMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al crear el producto', error: error.message });
+    }
+});
+
+app.patch('/api/products/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const productMap = await getSecondaryProductMap();
+        const existing = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        const updatedProduct = {
+            ...existing,
+            ...normalizeProductPayload({ ...existing, ...req.body || {}, id: existing.id }),
+            id: existing.id,
+            fecha_actualizacion: nowInTimeZone('America/Havana')
+        };
+
+        productMap[existing.id] = updatedProduct;
+        await persistSecondaryProductMap(productMap);
+        return res.json({ success: true, product: updatedProduct, products: Object.values(productMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar el producto', error: error.message });
+    }
+});
+
+app.delete('/api/products/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const productMap = await getSecondaryProductMap();
+        const existed = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!existed) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        delete productMap[id];
+        await persistSecondaryProductMap(productMap);
+        return res.json({ success: true, deletedId: id, products: Object.values(productMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el producto', error: error.message });
+    }
+});
+
+app.post('/api/products/:id/images', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { imagenes, action = 'replace' } = req.body || {};
+        const productMap = await getSecondaryProductMap();
+        const existing = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        const urls = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
+        const nextImages = action === 'append'
+            ? [...(existing.imagenes || []), ...urls]
+            : urls;
+
+        existing.imagenes = nextImages;
+        existing.fecha_actualizacion = nowInTimeZone('America/Havana');
+        productMap[existing.id] = existing;
+        await persistSecondaryProductMap(productMap);
+
+        return res.json({ success: true, product: existing, images: existing.imagenes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar imágenes del producto', error: error.message });
+    }
+});
+
+app.delete('/api/products/:id/images/:index', async (req, res) => {
+    try {
+        const { id, index } = req.params;
+        const productMap = await getSecondaryProductMap();
+        const existing = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
+        }
+
+        const imageIndex = Number(index);
+        if (!Number.isInteger(imageIndex) || imageIndex < 0 || imageIndex >= (existing.imagenes || []).length) {
+            return res.status(400).json({ success: false, message: 'Índice de imagen inválido.' });
+        }
+
+        existing.imagenes.splice(imageIndex, 1);
+        existing.fecha_actualizacion = nowInTimeZone('America/Havana');
+        productMap[existing.id] = existing;
+        await persistSecondaryProductMap(productMap);
+        return res.json({ success: true, product: existing, images: existing.imagenes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar la imagen del producto', error: error.message });
+    }
+});
+
+// Endpoint para obtener los pedidos nuevos desde la colección secundaria de Firebase.
+app.get('/api/new-orders', async (req, res) => {
+    try {
+        if (secondaryRtdb) {
+            const newOrders = await listSecondaryOrdersByBranch('new');
+            return res.json({ success: true, newOrders });
+        }
+
         if (!fs.existsSync(comparisonFilePath)) {
             return res.json({ success: true, newOrders: [] });
         }
@@ -911,11 +1254,108 @@ app.get('/api/new-orders', async (req, res) => {
     }
 });
 
+app.get('/api/orders/new', async (req, res) => {
+    try {
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('new') : [];
+        return res.json({ success: true, orders });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pedidos nuevos', error: error.message });
+    }
+});
+
+app.get('/api/orders/managed', async (req, res) => {
+    try {
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        return res.json({ success: true, orders });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener pedidos gestionados', error: error.message });
+    }
+});
+
+app.get('/api/orders/managed/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        const order = orders.find(item => item.id === id);
+        if (!order) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+        }
+        return res.json({ success: true, order });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el pedido gestionado', error: error.message });
+    }
+});
+
+app.post('/api/orders/managed', async (req, res) => {
+    const payload = req.body || {};
+    const created = normalizeManagedOrderPayload(payload);
+    if (!created.nombre_cliente || !created.telefono) {
+        return res.status(400).json({ success: false, message: 'Los campos "nombre_cliente" y "telefono" son obligatorios.' });
+    }
+
+    try {
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        orders.push(created);
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', orders);
+            return res.status(201).json({ success: true, order: created, orders });
+        }
+        return res.status(503).json({ success: false, message: 'La instancia secundaria de Firebase RTDB no está disponible para pedidos gestionados.' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al crear pedido gestionado', error: error.message });
+    }
+});
+
+app.patch('/api/orders/managed/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        const index = orders.findIndex(item => item.id === id);
+        if (index === -1) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+        }
+
+        const updatedOrder = {
+            ...orders[index],
+            ...req.body,
+            id,
+            fecha_actualizacion: nowInTimeZone('America/Havana')
+        };
+        orders[index] = updatedOrder;
+
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', orders);
+            return res.json({ success: true, order: updatedOrder, orders });
+        }
+
+        return res.status(503).json({ success: false, message: 'La instancia secundaria de Firebase RTDB no está disponible para pedidos gestionados.' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar el pedido gestionado', error: error.message });
+    }
+});
+
+app.delete('/api/orders/managed/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
+        const existing = orders.find(item => item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+        }
+
+        const filtered = orders.filter(item => item.id !== id);
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', filtered);
+            return res.json({ success: true, deletedId: id, orders: filtered });
+        }
+
+        return res.status(503).json({ success: false, message: 'La instancia secundaria de Firebase RTDB no está disponible para pedidos gestionados.' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el pedido gestionado', error: error.message });
+    }
+});
+
 // Endpoint para eliminar (descartar) un único pedido nuevo sin guardar.
-// Se identifica el pedido por su combinación única ip + fecha_hora_entrada.
-// El pedido se elimina de comparison.json y además se guarda en una lista de
-// "descartados" para que la verificación automática (cada 10-30s) no lo
-// vuelva a mostrar como pedido nuevo.
 app.delete('/api/new-orders', async (req, res) => {
     let release;
     try {
@@ -929,6 +1369,24 @@ app.delete('/api/new-orders', async (req, res) => {
         }
 
         const key = buildOrderKey({ ip, fecha_hora_entrada });
+
+        if (secondaryRtdb) {
+            const currentOrders = await listSecondaryOrdersByBranch('new');
+            const existiaPedido = currentOrders.some(order => buildOrderKey(order) === key);
+            const updatedOrders = currentOrders.filter(order => buildOrderKey(order) !== key);
+            await writeSecondaryOrdersByBranch('new', updatedOrders);
+            await writeSecondaryNode('orders/dismissed', await readSecondaryNode('orders/dismissed', []));
+            const dismissed = await readSecondaryNode('orders/dismissed', []);
+            if (!dismissed.some(item => item === key)) {
+                dismissed.push(key);
+                await writeSecondaryNode('orders/dismissed', dismissed);
+            }
+            return res.json({
+                success: true,
+                message: existiaPedido ? 'Pedido eliminado correctamente.' : 'El pedido ya no estaba en la lista, pero fue marcado como descartado.',
+                newOrders: updatedOrders
+            });
+        }
 
         // Asegurar que el archivo de comparación existe antes de bloquearlo
         if (!fs.existsSync(comparisonFilePath)) {
@@ -977,7 +1435,9 @@ app.delete('/api/new-orders', async (req, res) => {
 // GET /api/managed-orders → obtener el listado completo de gestión
 app.get('/api/managed-orders', async (req, res) => {
     try {
-        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const managedOrders = secondaryRtdb
+            ? await listSecondaryOrdersByBranch('managed')
+            : await readJsonFile(managedOrdersFilePath, []);
         res.json({ success: true, managedOrders });
     } catch (error) {
         addLog(`ERROR: No se pudo leer managed_orders.json: ${error.message}`);
@@ -1013,35 +1473,53 @@ app.post('/api/managed-orders', async (req, res) => {
 
         release = await lockfile.lock(managedOrdersFilePath);
 
-        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const managedOrders = secondaryRtdb
+            ? await listSecondaryOrdersByBranch('managed')
+            : await readJsonFile(managedOrdersFilePath, []);
 
         const fechaActual = nowInTimeZone('America/Havana');
 
         const nuevoPedidoGestionado = {
             id: crypto.randomUUID(),
             nombre_cliente: String(nombre_cliente),
-            pais: pais ? String(pais) : "N/A",
+            pais: pais ? String(pais) : 'N/A',
             telefono: String(telefono),
-            precio_total: precio_total !== undefined && precio_total !== null && precio_total !== "" ? Number(precio_total) : 0,
+            precio_total: precio_total !== undefined && precio_total !== null && precio_total !== '' ? Number(precio_total) : 0,
             aceptado: false,
             entregado: false,
             enviado_a_pagar: false,
             pagado: false,
             enviado_grupo_pagos: false,
-            origen: origen === "new-order" ? "new-order" : "manual",
-            source_key: origen === "new-order" && sourceKey ? buildOrderKey(sourceKey) : null,
+            origen: origen === 'new-order' ? 'new-order' : 'manual',
+            source_key: origen === 'new-order' && sourceKey ? buildOrderKey(sourceKey) : null,
             fecha_creacion: fechaActual,
             fecha_actualizacion: fechaActual
         };
 
         managedOrders.push(nuevoPedidoGestionado);
-        await writeJsonFile(managedOrdersFilePath, managedOrders);
+
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', managedOrders);
+        } else {
+            await writeJsonFile(managedOrdersFilePath, managedOrders);
+        }
 
         addLog(`Pedido agregado al listado de gestión: ${nuevoPedidoGestionado.nombre_cliente} (id: ${nuevoPedidoGestionado.id})`);
 
-        // Si el pedido proviene de la lista de pedidos nuevos, lo eliminamos de comparison.json
+        // Si el pedido proviene de la lista de pedidos nuevos, lo eliminamos de la colección secundaria
         // para que no aparezca como pedido nuevo mientras está en seguimiento.
-        if (origen === "new-order" && sourceKey && sourceKey.ip && sourceKey.fecha_hora_entrada) {
+        if (secondaryRtdb && origen === 'new-order' && sourceKey && sourceKey.ip && sourceKey.fecha_hora_entrada) {
+            try {
+                const key = buildOrderKey(sourceKey);
+                const currentOrders = await listSecondaryOrdersByBranch('new');
+                const updatedOrders = currentOrders.filter(order => buildOrderKey(order) !== key);
+                await writeSecondaryOrdersByBranch('new', updatedOrders);
+            } catch (dismissError) {
+                addLog(`WARN: No se pudo actualizar la colección secundaria de nuevos pedidos: ${dismissError.message}`);
+            }
+        }
+
+        if (!secondaryRtdb && origen === 'new-order' && sourceKey && sourceKey.ip && sourceKey.fecha_hora_entrada) {
             try {
                 const key = buildOrderKey(sourceKey);
                 let releaseComparison;
@@ -1094,7 +1572,9 @@ app.patch('/api/managed-orders/:id', async (req, res) => {
 
         release = await lockfile.lock(managedOrdersFilePath);
 
-        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const managedOrders = secondaryRtdb
+            ? await listSecondaryOrdersByBranch('managed')
+            : await readJsonFile(managedOrdersFilePath, []);
         const index = managedOrders.findIndex(order => order.id === id);
 
         if (index === -1) {
@@ -1113,7 +1593,11 @@ app.patch('/api/managed-orders/:id', async (req, res) => {
             fecha_actualizacion: nowInTimeZone('America/Havana')
         };
 
-        await writeJsonFile(managedOrdersFilePath, managedOrders);
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', managedOrders);
+        } else {
+            await writeJsonFile(managedOrdersFilePath, managedOrders);
+        }
 
         addLog(`Pedido gestionado actualizado (id: ${id}): ${JSON.stringify(cambios)}`);
 
@@ -1134,15 +1618,21 @@ app.delete('/api/managed-orders/:id', async (req, res) => {
 
         release = await lockfile.lock(managedOrdersFilePath);
 
-        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const managedOrders = secondaryRtdb
+            ? await listSecondaryOrdersByBranch('managed')
+            : await readJsonFile(managedOrdersFilePath, []);
         const orderToRemove = managedOrders.find(order => order.id === id);
         const updatedOrders = managedOrders.filter(order => order.id !== id);
 
-        await writeJsonFile(managedOrdersFilePath, updatedOrders);
+        if (secondaryRtdb) {
+            await writeSecondaryOrdersByBranch('managed', updatedOrders);
+        } else {
+            await writeJsonFile(managedOrdersFilePath, updatedOrders);
+        }
 
         addLog(`Pedido eliminado del listado de gestión (id: ${id}).`);
 
-        if (orderToRemove && orderToRemove.source_key) {
+        if (!secondaryRtdb && orderToRemove && orderToRemove.source_key) {
             try {
                 await compareLocalAndRemoteData();
             } catch (updateError) {
@@ -1460,7 +1950,9 @@ app.post("/api/send-test-notification", async (req, res) => {
 // API para listar tokens FCM suscritos al topic pedidos
 app.get('/api/fcm-tokens', async (req, res) => {
   try {
-    const tokens = await readJsonFile(fcmTokensFilePath, []);
+    const tokens = secondaryRtdb
+      ? await readSecondaryNode('subscriptions/tokens', [])
+      : await readJsonFile(fcmTokensFilePath, []);
     return res.json({ success: true, tokens });
   } catch (error) {
     const errorMsg = `ERROR al obtener tokens FCM: ${error.message}`;
@@ -1482,6 +1974,17 @@ app.post('/api/suscribir-pedidos', async (req, res) => {
 
     const sanitizedToken = token.trim();
     await admin.messaging().subscribeToTopic(sanitizedToken, 'pedidos');
+
+    if (secondaryRtdb) {
+      const tokens = await readSecondaryNode('subscriptions/tokens', []);
+      const nextTokens = Array.isArray(tokens) ? tokens : [];
+      if (!nextTokens.includes(sanitizedToken)) {
+        nextTokens.push(sanitizedToken);
+        await writeSecondaryNode('subscriptions/tokens', nextTokens);
+        addLog(`Token almacenado en RTDB secundaria: ${sanitizedToken}`);
+      }
+      return res.json({ success: true, message: 'Token suscrito al topic pedidos', token: sanitizedToken });
+    }
 
     const tokens = await readJsonFile(fcmTokensFilePath, []);
     if (!tokens.includes(sanitizedToken)) {
