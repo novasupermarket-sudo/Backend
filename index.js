@@ -345,6 +345,7 @@ function normalizeProductPayload(payload = {}) {
         descuento: Number(payload.descuento ?? 0),
         imagenes,
         activo: payload.activo !== false,
+        mas_vendido: Boolean(payload.mas_vendido),
         fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
         fecha_actualizacion: nowInTimeZone('America/Havana')
     };
@@ -382,6 +383,11 @@ function normalizePackPayload(payload = {}) {
         ? payload.productos
         : (payload.productos ? [payload.productos] : []);
 
+    // Lista de features/bullets del pack (una por línea en el panel).
+    const caracteristicas = Array.isArray(payload.caracteristicas)
+        ? payload.caracteristicas
+        : (payload.caracteristicas ? [payload.caracteristicas] : []);
+
     return {
         id: payload.id || crypto.randomUUID(),
         nombre: payload.nombre || 'Sin nombre',
@@ -392,8 +398,13 @@ function normalizePackPayload(payload = {}) {
         oferta: Boolean(payload.oferta),
         descuento: Number(payload.descuento ?? 0),
         imagenes,
+        imagen: payload.imagen || imagenes[0] || '',
         productos,
+        caracteristicas,
         activo: payload.activo !== false,
+        disponible: payload.disponible !== false,
+        top: Boolean(payload.top),
+        nuevo: Boolean(payload.nuevo),
         fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
         fecha_actualizacion: nowInTimeZone('America/Havana')
     };
