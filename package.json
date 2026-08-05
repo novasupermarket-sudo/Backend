@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "body-parser": "^2.2.2",
+    "cloudinary": "^2.6.0",
     "cors": "^2.8.5",
     "date-fns": "^2.30.0",
     "date-fns-tz": "^1.3.7",

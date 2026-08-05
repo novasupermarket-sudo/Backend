@@ -38,18 +38,24 @@ const rtdb = admin.database();
 // y CLOUDINARY_API_SECRET. Si no están configuradas, la subida/borrado se
 // omite de forma segura (no rompe el flujo, solo no gestiona la imagen).
 // -----------------------------------------------------------------------------
-const cloudinary = require('cloudinary').v2;
+let cloudinary = null;
 const CLOUDINARY_PRODUCTS_FOLDER = 'products';
 let cloudinaryConfigured = false;
 
-if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+try {
+    cloudinary = require('cloudinary').v2;
+} catch (error) {
+    console.warn('WARN: cloudinary no está instalado. La subida/borrado de imágenes de productos se omitirá.');
+}
+
+if (cloudinary && process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
     cloudinary.config({
         cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
         api_key: process.env.CLOUDINARY_API_KEY,
         api_secret: process.env.CLOUDINARY_API_SECRET
     });
     cloudinaryConfigured = true;
-} else {
+} else if (cloudinary) {
     console.warn('WARN: Cloudinary no está totalmente configurado (faltan CLOUDINARY_CLOUD_NAME/API_KEY/API_SECRET). La subida/borrado de imágenes de productos se omitirá.');
 }
 
