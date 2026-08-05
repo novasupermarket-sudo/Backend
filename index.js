@@ -364,6 +364,51 @@ async function persistSecondaryProductMap(productMap) {
     await rtdb.ref('products').set(productMap || {});
 }
 
+// -----------------------------------------------------------------------------
+// Soporte nativo para PACKS en la RTDB PRINCIPAL (rtdb), nodo "packs".
+// Estructura y flujo de trabajo análogos a "products": mismo tipo de mapa
+// { id: pack }, mismo manejo de imágenes vía Cloudinary y misma lógica de
+// creación/edición/borrado. La ruta social /p/:id también busca aquí si el
+// id/nombre no aparece en "products".
+// -----------------------------------------------------------------------------
+function normalizePackPayload(payload = {}) {
+    const imagenes = Array.isArray(payload.imagenes)
+        ? payload.imagenes
+        : (payload.imagenes ? [payload.imagenes] : []);
+
+    // Los productos que componen el pack se guardan tal cual llegan
+    // (array de ids, o de objetos { id, cantidad }, según use el frontend).
+    const productos = Array.isArray(payload.productos)
+        ? payload.productos
+        : (payload.productos ? [payload.productos] : []);
+
+    return {
+        id: payload.id || crypto.randomUUID(),
+        nombre: payload.nombre || 'Sin nombre',
+        descripcion: payload.descripcion || '',
+        precio: Number(payload.precio ?? 0),
+        categoria: payload.categoria || 'general',
+        stock: Number(payload.stock ?? 0),
+        oferta: Boolean(payload.oferta),
+        descuento: Number(payload.descuento ?? 0),
+        imagenes,
+        productos,
+        activo: payload.activo !== false,
+        fecha_creacion: payload.fecha_creacion || nowInTimeZone('America/Havana'),
+        fecha_actualizacion: nowInTimeZone('America/Havana')
+    };
+}
+
+async function getPackMap() {
+    const snapshot = await rtdb.ref('packs').once('value');
+    const map = snapshot.val();
+    return map && typeof map === 'object' ? map : {};
+}
+
+async function persistPackMap(packMap) {
+    await rtdb.ref('packs').set(packMap || {});
+}
+
 function normalizeManagedOrderPayload(payload = {}) {
     const fechaActual = nowInTimeZone('America/Havana');
     return {
@@ -608,16 +653,27 @@ app.get(/^\/p\/(.*)/, async (req, res) => {
         const productsObj = snapshot.val() || {};
         const productsArray = Object.values(productsObj);
 
-        // Búsqueda en los productos
-        const product = productsArray.find(p => {
+        const searchId = String(id).trim();
+        const matchesSearchId = (p) => {
             const prodId = String(p.id).trim();
             const prodNombreEscaped = _escapeHtml(p.nombre).trim();
-            const searchId = String(id).trim();
             return prodId === searchId || prodNombreEscaped === searchId;
-        });
+        };
+
+        // Búsqueda en los productos
+        let product = productsArray.find(matchesSearchId);
+
+        // Si no se encontró entre los productos, buscar también entre los
+        // packs (misma RTDB principal, nodo "packs") antes de dar "no encontrado".
+        if (!product) {
+            const packsSnapshot = await rtdb.ref("packs").once("value");
+            const packsObj = packsSnapshot.val() || {};
+            const packsArray = Object.values(packsObj);
+            product = packsArray.find(matchesSearchId);
+        }
 
         if (!product) {
-            console.log(`[Backend] Producto "${id}" no encontrado.`);
+            console.log(`[Backend] Producto/Pack "${id}" no encontrado.`);
             return res.send(`<!DOCTYPE html>
         <html lang="es">
         <head>
@@ -1585,6 +1641,170 @@ app.delete('/api/products/:id/images/:index', async (req, res) => {
         return res.json({ success: true, product: existing, images: existing.imagenes });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al eliminar la imagen del producto', error: error.message });
+    }
+});
+
+// =====================================================
+// 📦 CRUD NATIVO DE PACKS (RTDB principal, nodo "packs")
+// Misma estructura y comportamiento que /api/products.
+// =====================================================
+
+app.get('/api/packs', async (req, res) => {
+    try {
+        const packMap = await getPackMap();
+        return res.json({ success: true, packs: Object.values(packMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener packs', error: error.message });
+    }
+});
+
+app.get('/api/packs/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const packMap = await getPackMap();
+        const pack = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!pack) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        return res.json({ success: true, pack });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el pack', error: error.message });
+    }
+});
+
+app.post('/api/packs', async (req, res) => {
+    try {
+        const body = req.body || {};
+        if (!body.nombre) {
+            return res.status(400).json({ success: false, message: 'El campo "nombre" es obligatorio.' });
+        }
+
+        // Sube a Cloudinary cualquier imagen nueva (data URI o URL) recibida
+        // en "imagenes"; conserva tal cual los public_id ya existentes.
+        const imagenesProcesadas = await processProductImages(body.imagenes);
+        const incoming = normalizePackPayload({ ...body, imagenes: imagenesProcesadas });
+
+        const packMap = await getPackMap();
+        packMap[incoming.id] = incoming;
+        await persistPackMap(packMap);
+
+        return res.status(201).json({ success: true, pack: incoming, packs: Object.values(packMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al crear el pack', error: error.message });
+    }
+});
+
+async function actualizarPackHandler(req, res) {
+    try {
+        const { id } = req.params;
+        const packMap = await getPackMap();
+        const existing = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        const body = { ...req.body || {} };
+        if (body.imagenes !== undefined) {
+            // Sube las imágenes nuevas y deja intactas las que ya eran public_id existentes
+            body.imagenes = await processProductImages(body.imagenes);
+        }
+
+        const updatedPack = {
+            ...existing,
+            ...normalizePackPayload({ ...existing, ...body, id: existing.id }),
+            id: existing.id,
+            fecha_actualizacion: nowInTimeZone('America/Havana')
+        };
+
+        packMap[existing.id] = updatedPack;
+        await persistPackMap(packMap);
+        return res.json({ success: true, pack: updatedPack, packs: Object.values(packMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar el pack', error: error.message });
+    }
+}
+app.patch('/api/packs/:id', actualizarPackHandler);
+app.put('/api/packs/:id', actualizarPackHandler);
+
+app.delete('/api/packs/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const packMap = await getPackMap();
+        const existed = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!existed) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        // Eliminar también las imágenes del pack en Cloudinary (best-effort)
+        const imagenesAEliminar = Array.isArray(existed.imagenes) ? existed.imagenes : [];
+        await Promise.all(imagenesAEliminar.map(publicId => cloudinaryDeleteProductImage(publicId)));
+
+        delete packMap[id];
+        await persistPackMap(packMap);
+        return res.json({ success: true, deletedId: id, packs: Object.values(packMap) });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar el pack', error: error.message });
+    }
+});
+
+app.post('/api/packs/:id/images', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { imagenes, action = 'replace' } = req.body || {};
+        const packMap = await getPackMap();
+        const existing = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        // Sube a Cloudinary las imágenes nuevas (data URI o URL)
+        const uploaded = await processProductImages(imagenes);
+
+        if (action === 'replace') {
+            // Si se reemplazan todas las imágenes, borra de Cloudinary las anteriores
+            const anteriores = Array.isArray(existing.imagenes) ? existing.imagenes : [];
+            await Promise.all(anteriores.map(publicId => cloudinaryDeleteProductImage(publicId)));
+        }
+
+        const nextImages = action === 'append'
+            ? [...(existing.imagenes || []), ...uploaded]
+            : uploaded;
+
+        existing.imagenes = nextImages;
+        existing.fecha_actualizacion = nowInTimeZone('America/Havana');
+        packMap[existing.id] = existing;
+        await persistPackMap(packMap);
+
+        return res.json({ success: true, pack: existing, images: existing.imagenes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al actualizar imágenes del pack', error: error.message });
+    }
+});
+
+app.delete('/api/packs/:id/images/:index', async (req, res) => {
+    try {
+        const { id, index } = req.params;
+        const packMap = await getPackMap();
+        const existing = packMap[id] || Object.values(packMap).find(item => item && item.id === id);
+        if (!existing) {
+            return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
+        }
+
+        const imageIndex = Number(index);
+        if (!Number.isInteger(imageIndex) || imageIndex < 0 || imageIndex >= (existing.imagenes || []).length) {
+            return res.status(400).json({ success: false, message: 'Índice de imagen inválido.' });
+        }
+
+        const [publicIdEliminado] = existing.imagenes.splice(imageIndex, 1);
+        await cloudinaryDeleteProductImage(publicIdEliminado);
+
+        existing.fecha_actualizacion = nowInTimeZone('America/Havana');
+        packMap[existing.id] = existing;
+        await persistPackMap(packMap);
+        return res.json({ success: true, pack: existing, images: existing.imagenes });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar la imagen del pack', error: error.message });
     }
 });
 
