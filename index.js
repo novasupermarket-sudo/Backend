@@ -1162,15 +1162,24 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
         const { id: _ignoredId, ...datosPedido } = pedidoOriginal;
         const usuarioReincidente = await checkUsuarioReincidente(pedidoOriginal, pedidoOriginal.id);
 
+        // Estados aceptados al crear el registro asignado. El panel manda
+        // { aceptado, entregado, pendiente_pago, pagado } (booleanos); se
+        // mantiene "estado" solo por compatibilidad con integraciones viejas.
+        const CAMPOS_ESTADO = ['aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado'];
+        const estadosIniciales = {};
+        if (req.body && typeof req.body === 'object') {
+            CAMPOS_ESTADO.forEach(campo => {
+                if (req.body[campo] !== undefined) estadosIniciales[campo] = req.body[campo];
+            });
+        }
+
         const nuevoRegistro = {
             ...datosPedido,
             pedido_origen_id: pedidoOriginal.id,
             usuarioReincidente,
             fecha_asignacion: nowInTimeZone('America/Havana'),
-            ...(req.body && typeof req.body === 'object' ? { estado: req.body.estado } : {})
+            ...estadosIniciales
         };
-        // No guardar la clave "estado" como undefined si no vino en el body
-        if (nuevoRegistro.estado === undefined) delete nuevoRegistro.estado;
 
         const asignadoId = await addSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, nuevoRegistro);
         const pedidoAsignado = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, asignadoId);
