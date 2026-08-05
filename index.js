@@ -350,19 +350,18 @@ function normalizeProductPayload(payload = {}) {
     };
 }
 
+// NOTA IMPORTANTE: el catálogo de productos real de la tienda vive en la
+// RTDB PRINCIPAL (rtdb), nodo "products" — es el mismo nodo que ya lee
+// /p/:id para las meta tags de WhatsApp/redes. El panel de administración
+// debe editar exactamente esos productos, no una copia aparte.
 async function getSecondaryProductMap() {
-    if (!secondaryRtdb) {
-        return {};
-    }
-    const map = await readSecondaryNode('catalog/products', {});
+    const snapshot = await rtdb.ref('products').once('value');
+    const map = snapshot.val();
     return map && typeof map === 'object' ? map : {};
 }
 
 async function persistSecondaryProductMap(productMap) {
-    if (!secondaryRtdb) {
-        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
-    }
-    await writeSecondaryNode('catalog/products', productMap || {});
+    await rtdb.ref('products').set(productMap || {});
 }
 
 function normalizeManagedOrderPayload(payload = {}) {
@@ -1182,6 +1181,55 @@ app.delete('/api/pedidos-asignados/:id', async (req, res) => {
     }
 });
 
+// =====================================================
+// 🔔 BANNER DE NOTIFICACIÓN (RTDB principal, nodo /notificationBanner)
+// Estructura: { id, icono, titulo, subtitulo, mensaje, tipo }
+// El "id" SIEMPRE se regenera al guardar (distinto al anterior) para que
+// el frontend de la tienda lo detecte como una notificación nueva.
+// =====================================================
+const NOTIFICATION_BANNER_PATH = 'notificationBanner';
+
+app.get('/api/notification-banner', async (req, res) => {
+    try {
+        const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
+        const banner = snapshot.val();
+        return res.json({ success: true, banner: banner || null });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el banner de notificación', error: error.message });
+    }
+});
+
+async function guardarNotificationBannerHandler(req, res) {
+    try {
+        const body = req.body || {};
+        const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
+        const actual = snapshot.val() || {};
+
+        // El id nunca lo decide el cliente: se regenera siempre distinto al
+        // anterior (timestamp en milisegundos) para que se detecte como nuevo.
+        let nuevoId = Date.now();
+        if (nuevoId === actual.id) nuevoId += 1;
+
+        const banner = {
+            id: nuevoId,
+            icono: body.icono !== undefined ? String(body.icono) : (actual.icono || 'fas fa-bell'),
+            titulo: body.titulo !== undefined ? String(body.titulo) : (actual.titulo || ''),
+            subtitulo: body.subtitulo !== undefined ? String(body.subtitulo) : (actual.subtitulo || ''),
+            mensaje: body.mensaje !== undefined ? String(body.mensaje) : (actual.mensaje || ''),
+            tipo: body.tipo !== undefined ? String(body.tipo) : (actual.tipo || 'info')
+        };
+
+        await rtdb.ref(NOTIFICATION_BANNER_PATH).set(banner);
+        addLog(`Banner de notificación actualizado (id: ${banner.id}).`);
+        return res.json({ success: true, banner });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al guardar el banner de notificación', error: error.message });
+    }
+}
+app.post('/api/notification-banner', guardarNotificationBannerHandler);
+app.put('/api/notification-banner', guardarNotificationBannerHandler);
+app.patch('/api/notification-banner', guardarNotificationBannerHandler);
+
 // Nueva ruta API para obtener el estado del servidor
 app.get("/api/server-status", async (req, res) => {
     addLog("Solicitud de estado del servidor recibida");
@@ -1381,16 +1429,12 @@ app.get("/api/get-comparison", async (req, res) => {
 });
 
 // =====================================================
-// 📦 CRUD DE PRODUCTOS (según nueva base aislada en RTDB)
+// 📦 CRUD DE PRODUCTOS (catálogo real de la tienda, RTDB principal /products)
 // =====================================================
 app.get('/api/products', async (req, res) => {
     try {
-        if (!secondaryRtdb) {
-            return res.json({ success: true, products: [] });
-        }
-
-        const products = await readSecondaryCollection('catalog/products');
-        return res.json({ success: true, products });
+        const productMap = await getSecondaryProductMap();
+        return res.json({ success: true, products: Object.values(productMap) });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener productos', error: error.message });
     }
@@ -1399,10 +1443,6 @@ app.get('/api/products', async (req, res) => {
 app.get('/api/products/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        if (!secondaryRtdb) {
-            return res.status(503).json({ success: false, message: 'La instancia secundaria de Firebase RTDB no está disponible.' });
-        }
-
         const productMap = await getSecondaryProductMap();
         const product = productMap[id] || Object.values(productMap).find(item => item && item.id === id);
         if (!product) {
