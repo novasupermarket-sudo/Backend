@@ -67,7 +67,9 @@ async function cloudinaryUploadProductImage(source, desiredPublicId) {
     const uploadOptions = {
         folder: CLOUDINARY_PRODUCTS_FOLDER,
         overwrite: true,
-        resource_type: 'image'
+        resource_type: 'image',
+        fetch_format: 'auto',
+        quality: 'auto'
     };
     if (desiredPublicId) {
         uploadOptions.public_id = desiredPublicId;
@@ -886,7 +888,10 @@ app.get("/obtener-estadisticas", async (req, res) => {
     }
 });
 
-const GOOGLE_APPS_SCRIPT_CORREO_URL = "https://script.google.com/macros/s/AKfycbytMcaOnCRpVJ2STIlXNXj5vs2G_BwSccYPcsHBXDyfJ_6yjUy_8X8ARm3bhC9eAqAB/exec";
+const GOOGLE_APPS_SCRIPT_CORREO_URL = process.env.GOOGLE_APPS_SCRIPT_CORREO_URL || '';
+if (!GOOGLE_APPS_SCRIPT_CORREO_URL) {
+    console.warn('WARN: GOOGLE_APPS_SCRIPT_CORREO_URL no está configurada. No se enviarán correos desde Google Apps Script.');
+}
 
 // Ruta POST para recibir los datos del pedido desde el frontend
 app.post('/send-pedido', async (req, res) => {
@@ -913,24 +918,30 @@ app.post('/send-pedido', async (req, res) => {
     }
 
     try {
-        console.log('Enviando datos a Google Apps Script para correo...');
-        const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(orderData),
-        });
+        let correoSuccess = false;
+        let gasResponse = null;
 
-        const textResponse = await response.text();
-        let gasResponse;
+        if (GOOGLE_APPS_SCRIPT_CORREO_URL) {
+            console.log('Enviando datos a Google Apps Script para correo...');
+            const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(orderData),
+            });
 
-        try {
-            gasResponse = JSON.parse(textResponse);
-        } catch (e) {
-            console.warn('Respuesta no es JSON válido:', textResponse);
-            gasResponse = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
+            const textResponse = await response.text();
+            try {
+                gasResponse = JSON.parse(textResponse);
+            } catch (e) {
+                console.warn('Respuesta no es JSON válido:', textResponse);
+                gasResponse = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
+            }
+
+            correoSuccess = response.ok && gasResponse.status === 'success';
+        } else {
+            gasResponse = { status: 'skipped', message: 'No se configuró GOOGLE_APPS_SCRIPT_CORREO_URL' };
         }
 
-        const correoSuccess = response.ok && gasResponse.status === 'success';
         const overallSuccess = backupSaved || correoSuccess;
 
         const nombreComprador = orderData.nombre_comprador || 'Cliente Nuevo';
