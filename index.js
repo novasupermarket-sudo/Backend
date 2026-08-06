@@ -291,6 +291,28 @@ async function deleteSecondaryPushRecord(refPath, id) {
     await secondaryRtdb.ref(`${refPath}/${id}`).remove();
 }
 
+async function allocateNextOrderNumber() {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+
+    const counterRef = secondaryRtdb.ref('order_counter/lastNumber');
+    const transactionResult = await counterRef.transaction(current => {
+        const currentValue = Number(current);
+        if (Number.isNaN(currentValue) || currentValue < 0) {
+            return 1;
+        }
+        return currentValue + 1;
+    });
+
+    if (!transactionResult.committed) {
+        throw new Error('No se pudo generar el número de orden.');
+    }
+
+    const nextNumber = Number(transactionResult.snapshot.val() || 0);
+    return `BS-${String(nextNumber).padStart(2, '0')}`;
+}
+
 // Determina si un pedido pertenece al mismo usuario que otro, comparando por
 // teléfono, correo o un id explícito (lo que esté disponible en ambos).
 function ordersBelongToSameUser(a, b) {
@@ -823,19 +845,22 @@ app.post("/guardar-estadistica", async (req, res) => {
         };
 
         if (tieneCompras) {
+            const orderNumber = await allocateNextOrderNumber();
             const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, {
                 ...registroBase,
-                compras: nuevaEstadistica.compras
+                compras: nuevaEstadistica.compras,
+                orderNumber,
+                numero_orden: orderNumber
             });
-            addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}).`);
+            addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
+            return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
         } else {
             const estadisticas = estadisticasPrevias;
             estadisticas.push(registroBase); // sin "compras": los stats puros no llevan compras
             await persistUserStatisticsToSecondary(estadisticas);
             addLog("Estadística guardada correctamente en /estadisticas.");
+            return res.json({ message: "Estadística guardada correctamente" });
         }
-
-        return res.json({ message: "Estadística guardada correctamente" });
     } catch (error) {
         addLog(`ERROR: Error en /guardar-estadistica: ${error.message}`);
         if (error.message && error.message.includes('instancia secundaria de Firebase RTDB')) {
@@ -861,13 +886,8 @@ app.get("/obtener-estadisticas", async (req, res) => {
     }
 });
 
-// ** IMPORTANTE: REEMPLAZA ESTA URL CON LA URL DE TU APLICACIÓN WEB DE APPS SCRIPT **
-// Esta es la URL que obtuviste al publicar tu script de Google Apps Script como Web App.
-const GOOGLE_APPS_SCRIPT_SHEETS_URL = "https://script.google.com/macros/s/AKfycbzcX8GDu-6sMegdKKAn5DgLMp9E8BzcM6C3j6WttFiAwiU1RhA42eDzAxIgql-Eat2xhA/exec";
-
 const GOOGLE_APPS_SCRIPT_CORREO_URL = "https://script.google.com/macros/s/AKfycbytMcaOnCRpVJ2STIlXNXj5vs2G_BwSccYPcsHBXDyfJ_6yjUy_8X8ARm3bhC9eAqAB/exec";
 
-// Ruta POST para recibir los datos del pedido desde el frontend
 // Ruta POST para recibir los datos del pedido desde el frontend
 app.post('/send-pedido', async (req, res) => {
     console.log('📦 Recibida solicitud de pedido desde el frontend.');
@@ -878,226 +898,98 @@ app.post('/send-pedido', async (req, res) => {
         return res.status(400).json({ success: false, message: 'Datos de pedido no proporcionados.' });
     }
 
-    // 0. Respaldo inmediato en Firebase Realtime Database.
-    // Esto se guarda SIEMPRE, incluso si Google Sheets/Apps Script falla más
-    // adelante, para que ningún pedido se pierda nunca.
+    let backupSaved = false;
+    let pedidoRef;
+
     try {
-        const pedidoRef = await rtdb.ref('pedidos').push({
+        pedidoRef = await rtdb.ref('pedidos').push({
             ...orderData,
             fecha_registro_backend: new Date().toISOString()
         });
         console.log('📦 Respaldo del pedido guardado en Firebase con key:', pedidoRef.key);
+        backupSaved = true;
     } catch (firebaseBackupError) {
         console.error('⚠️ No se pudo guardar el respaldo del pedido en Firebase:', firebaseBackupError);
-        // No se corta el flujo: seguimos intentando con Google igualmente.
     }
 
     try {
-        // 1. Enviar los datos al primer script (Web App)
-        console.log('Enviando datos a Google Apps Script (Principal)...');
+        console.log('Enviando datos a Google Apps Script para correo...');
         const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(orderData),
         });
 
-        // 2. Enviar los datos al segundo script (Sheets)
-        console.log('Enviando datos a Google Apps Script (Sheets)...');
-        const responseSheets = await fetch(GOOGLE_APPS_SCRIPT_SHEETS_URL,{
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(orderData),
-        });
-
-        // 3. Procesar las respuestas de texto a JSON de forma segura
-        const textResponse1 = await response.text();
-        const textResponse2 = await responseSheets.text();
-        
-        let gasResponse, gasResponseSheets;
+        const textResponse = await response.text();
+        let gasResponse;
 
         try {
-            gasResponse = JSON.parse(textResponse1);
+            gasResponse = JSON.parse(textResponse);
         } catch (e) {
-            console.warn('Respuesta 1 no es JSON válido:', textResponse1);
-            gasResponse = { status: "error", message: "Respuesta no válida del script principal", raw: textResponse1 };
+            console.warn('Respuesta no es JSON válido:', textResponse);
+            gasResponse = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
         }
 
-        try {
-            gasResponseSheets = JSON.parse(textResponse2);
-        } catch (e) {
-            console.warn('Respuesta 2 no es JSON válido:', textResponse2);
-            gasResponseSheets = { status: "error", message: "Respuesta no válida del script sheets", raw: textResponse2 };
-        }
+        const correoSuccess = response.ok && gasResponse.status === 'success';
+        const overallSuccess = backupSaved || correoSuccess;
 
-        console.log('Respuestas recibidas de Google. Actualizando local...');
+        const nombreComprador = orderData.nombre_comprador || 'Cliente Nuevo';
+        const totalPedido = orderData.precio_compra_total || '0.00';
 
-        // 4. Ejecutar la función local para actualizar la comparación
-        try {
-            await compareLocalAndRemoteData();
-            console.log('Comparación de pedidos actualizada tras nuevo pedido.');
-        } catch (updateError) {
-            console.error('Error al actualizar comparación tras pedido:', updateError);
-        }
+        const message = {
+            notification: {
+                title: '¡Nuevo Pedido Recibido! 📦',
+                body: `${nombreComprador} ha comprado un total de $${totalPedido}.`
+            },
+            data: {
+                origen: String(orderData.origen || 'web'),
+                click_action: 'FLUTTER_NOTIFICATION_CLICK'
+            },
+            topic: 'pedidos'
+        };
 
-        // =================================================================
-        // 🔥 ENVIAR NOTIFICACIÓN PUSH TRAS COMPROBAR ÉXITO DE GOOGLE
-        // =================================================================
-        const mainSuccess = response.ok && gasResponse.status === "success";
-        const sheetsSuccess = responseSheets.ok && gasResponseSheets.status === "success";
+        admin.messaging().send(message)
+            .then((responsePush) => {
+                addLog(`Push enviado con éxito: ${responsePush}`);
+                console.log('Push enviado con éxito:', responsePush);
+            })
+            .catch((errorPush) => {
+                addLog(`ERROR enviando Push: ${errorPush.message}`);
+                console.error('Error enviando notificación Push:', errorPush);
+            });
 
-        if (mainSuccess && sheetsSuccess) {
-            
-            // Construimos la estructura de la notificación push orientada a un canal (Topic)
-            const nombreComprador = orderData.nombre_comprador || "Cliente Nuevo";
-            const totalPedido = orderData.precio_compra_total || "0.00";
-
-            const message = {
-                notification: {
-                    title: '¡Nuevo Pedido Recibido! 📦',
-                    body: `${nombreComprador} ha comprado un total de $${totalPedido}.`
-                },
-                data: {
-                    origen: String(orderData.origen || 'web'),
-                    click_action: 'FLUTTER_NOTIFICATION_CLICK' 
-                },
-                topic: 'pedidos' // Canal al que va dirigida la notificación
-            };
-
-            // Enviar la notificación de manera asíncrona (no bloquea la respuesta del cliente)
-            admin.messaging().send(message)
-                .then((responsePush) => {
-                    addLog(`Push enviado con éxito: ${responsePush}`);
-                    console.log('Push enviado con éxito:', responsePush);
-                })
-                .catch((errorPush) => {
-                    addLog(`ERROR enviando Push: ${errorPush.message}`);
-                    console.error('Error enviando notificación Push:', errorPush);
-                });
-
-            // Caso ideal: Ambos funcionaron
+        if (overallSuccess) {
             return res.status(200).json({
                 success: true,
-                message: 'Pedido enviado correctamente y notificación push procesada.',
-                gasResponse: gasResponse,
-                gasResponseSheets: gasResponseSheets
-            });
-        } else {
-            console.error('Hubo un error en uno de los servicios externos.');
-            return res.status(502).json({ 
-                success: false,
-                message: 'El pedido se procesó parcialmente o hubo un error en los servicios de Google.',
-                details: {
-                    principal: { success: mainSuccess, response: gasResponse },
-                    sheets: { success: sheetsSuccess, response: gasResponseSheets }
-                }
+                message: 'Pedido recibido y guardado en Firebase.',
+                orderNumber: orderData.orderNumber || orderData.numero_orden || null,
+                pedidoKey: pedidoRef ? pedidoRef.key : null,
+                correoSuccess,
+                gasResponse,
+                backupSaved
             });
         }
 
+        console.error('ERROR: No se pudo validar ninguna ruta de persistencia.');
+        return res.status(502).json({
+            success: false,
+            message: 'No se pudo guardar el pedido ni ejecutar el envío de correo.',
+            backupSaved,
+            correoSuccess,
+            gasResponse
+        });
     } catch (error) {
-        console.error('❌ Error CRÍTICO en el backend al procesar el pedido:', error);
-        if (!res.headersSent) {
-            return res.status(500).json({
-                success: false,
-                message: 'Error interno del servidor al procesar el pedido.',
-                error: error.message
-            });
-        }
+        console.error('❌ Error CRÍTICO en /send-pedido:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Error interno del servidor al procesar el pedido.',
+            error: error.message,
+            backupSaved
+        });
     }
 });
 
 
-app.post('/delete-order', async (req, res) => {
-    const { rows } = req.body;
-
-    if (!rows || !Array.isArray(rows) || rows.length === 0) {
-        return res.status(400).json({ success: false, message: "Debes enviar un array de filas" });
-    }
-
-    try {
-        const response = await fetch(GOOGLE_APPS_SCRIPT_SHEETS_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                action: "deleteMultipleRows",
-                rows: rows
-            })
-        });
-
-        const result = await response.json();
-
-        if (result.status === "success") {
-            return res.json({ success: true, message: "Pedido eliminado correctamente" });
-        } else {
-            return res.status(500).json({ success: false, message: result.message });
-        }
-
-    } catch (error) {
-        return res.status(500).json({ success: false, message: error.message });
-    }
-});
-
-
-app.get('/api/pedidos-sheets', async (req, res) => {
-    try {
-        const response = await fetch(GOOGLE_APPS_SCRIPT_SHEETS_URL);
-        const data = await response.json();
-
-        if (data.status !== "success") {
-            return res.status(500).json({ success: false, message: "Error desde Apps Script" });
-        }
-
-        const filas = data.data;
-
-        // Agrupar por ip + fecha_hora_entrada
-        const pedidosAgrupados = {};
-
-        filas.forEach(fila => {
-            const key = fila.ip + "_" + fila.fecha_hora_entrada;
-
-            if (!pedidosAgrupados[key]) {
-                pedidosAgrupados[key] = {
-                    ip: fila.ip,
-                    pais: fila.pais,
-                    fecha_hora_entrada: fila.fecha_hora_entrada,
-                    origen: fila.origen,
-                    afiliado: fila.afiliado,
-                    duracion_sesion_segundos: fila.duracion_sesion_segundos,
-                    tiempo_carga_pagina_ms: fila.tiempo_carga_pagina_ms,
-                    nombre_comprador: fila.nombre_comprador,
-                    telefono_comprador: fila.telefono_comprador,
-                    nombre_persona_entrega: fila.nombre_persona_entrega,
-                    telefono_persona_entrega: fila.telefono_persona_entrega,
-                    correo_comprador: fila.correo_comprador,
-                    direccion_envio: fila.direccion_envio,
-                    compras: [],
-                    precio_compra_total: fila.precio_compra_total_pedido,
-                    navegador: fila.navegador,
-                    sistema_operativo: fila.sistema_operativo,
-                    tipo_usuario: fila.tipo_usuario,
-                    tiempo_promedio_pagina: fila.tiempo_promedio_pagina,
-                    fuente_trafico: fila.fuente_trafico
-                };
-            }
-
-            pedidosAgrupados[key].compras.push({
-                id: fila.id || null,
-                name: fila.producto_name,
-                quantity: fila.producto_quantity,
-                unitPrice: fila.producto_unitPrice,
-                discount: fila.producto_discount,
-                rowNumber: fila.rowNumber
-            });
-        });
-
-        res.json({
-            success: true,
-            pedidos: Object.values(pedidosAgrupados)
-        });
-
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
-});
 
 // =====================================================
 // 🧾 CRUD DE /pedidos (RTDB secundaria)
